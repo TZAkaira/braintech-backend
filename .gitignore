@@ -1,0 +1,5 @@
+venv311/
+users.db
+*.pkl
+__pycache__/
+*.pyc
