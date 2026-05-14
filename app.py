@@ -13,30 +13,25 @@ from scipy import stats as scipy_stats
 import io
 from PIL import Image
 import cv2
+import os
 
 app = Flask(__name__)
 CORS(app)
 DB_NAME = "users.db"
 
-# ── Load ET Model ──────────────────────────────────────────
 with open("et_model.pkl", 'rb') as f:
     model_data = pickle.load(f)
-
 et_model = model_data['model']
 scaler   = model_data['scaler']
 
-# ── Load Epochs ────────────────────────────────────────────
 with open("all_epochs_final.pkl", 'rb') as f:
     all_epochs = pickle.load(f)
 
-# ── Load VGG stored features ───────────────────────────────
 with open("stored_vgg_features.pkl", 'rb') as f:
     stored_data = pickle.load(f)
-
 stored_vgg    = stored_data['vgg_features']
 stored_labels = stored_data['labels']
 
-# ── Load VGG16 ─────────────────────────────────────────────
 vgg_model = VGG16(
     weights='imagenet',
     include_top=False,
@@ -45,21 +40,17 @@ vgg_model = VGG16(
 )
 print("VGG16 loaded!")
 
-# ── Load Face Detector (Haar Cascade) ─────────────────────
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 )
 print("Face detector loaded!")
 
-# ── KNN setup ─────────────────────────────────────────────
 scaler_vgg        = StandardScaler()
 stored_vgg_scaled = scaler_vgg.fit_transform(stored_vgg)
-
 knn = NearestNeighbors(n_neighbors=10, metric='cosine', algorithm='brute')
 knn.fit(stored_vgg_scaled)
 print("KNN ready!")
 
-# ── EEG feature extraction ────────────────────────────────
 CH_NAMES = ['P7','P4','Cz','Pz','P3','P8','O1','O2','T8','F8',
             'C4','F4','Fz','C3','F3','T7','F7','Oz','PO4','CP6',
             'CP2','CP1','CP5','PO3']
@@ -94,7 +85,6 @@ SIG_INDICES    = [ALL_FEAT_NAMES.index(f) for f in SIG_FEAT_NAMES]
 def extract_all_eeg_features(epoch_data):
     times_local = np.linspace(-200, 800, 500)
     features    = []
-
     features.append(epoch_data.mean())
     features.append(epoch_data.var())
     features.append(epoch_data.std())
@@ -153,7 +143,6 @@ def extract_all_eeg_features(epoch_data):
     return np.array(features)
 
 
-# ── DB ─────────────────────────────────────────────────────
 def get_db():
     return sqlite3.connect(DB_NAME)
 
@@ -213,7 +202,6 @@ def login():
     return jsonify({"message": "Login successful"})
 
 
-# ── PREDICT ────────────────────────────────────────────────
 @app.route("/predict", methods=["POST"])
 def predict():
     if 'image' not in request.files:
@@ -221,42 +209,41 @@ def predict():
 
     img_bytes = request.files['image'].read()
 
-    # ===== STEP 0: PIL se open karo =====
     try:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     except Exception as e:
-        return jsonify({"error": "Invalid image file. Please upload a JPG or PNG image."}), 400
+        return jsonify({"error": "Invalid image file"}), 400
 
-    # ===== STEP 0.5: Face detection =====
+    # ===== Face Detection — VR ke liye bypass =====
     try:
         cv_img = np.array(pil_img)
         gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
         faces  = face_cascade.detectMultiScale(
                     gray,
                     scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(30, 30)
+                    minNeighbors=3,
+                    minSize=(20, 20)
                  )
-        if len(faces) == 0:
-            return jsonify({
-                "error": "No face detected. Please upload a clear celebrity face image. Supported celebrities: Katrina Kaif, Ajay Devgan, Amitabh Bachchan, Cristiano Ronaldo, Neymar Jr."
-            }), 400
+        # VR mode mein face na mile toh bhi continue karo
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            pil_img = pil_img.crop((x, y, x+w, y+h))
     except Exception as e:
         print(f"Face detection error: {e}")
         pass
 
-    # ===== STEP 1: VGG16 features =====
+    # ===== VGG16 features =====
     img     = pil_img.resize((224, 224))
     img_arr = keras_image.img_to_array(img)
     img_arr = np.expand_dims(img_arr, axis=0)
     img_arr = preprocess_input(img_arr)
     new_vgg = vgg_model.predict(img_arr, verbose=0).flatten()
 
-    # ===== STEP 2: KNN matching =====
+    # ===== KNN matching =====
     new_vgg_scaled     = scaler_vgg.transform(new_vgg.reshape(1, -1))
     distances, indices = knn.kneighbors(new_vgg_scaled)
 
-    # ===== STEP 3: EEG features + classification =====
+    # ===== EEG + ET classification =====
     predictions = []
     probas      = []
 
@@ -270,7 +257,7 @@ def predict():
         predictions.append(int(pred))
         probas.append(proba.tolist())
 
-    # ===== STEP 4: Majority voting =====
+    # ===== Majority voting =====
     probas_arr = np.array(probas)
     avg_proba  = probas_arr.mean(axis=0)
     final_pred = int(np.argmax(avg_proba))
@@ -281,14 +268,12 @@ def predict():
         "confidence": round(float(avg_proba[final_pred]), 2)
     })
 
+
 @app.route("/")
 def home():
     return "Backend running successfully"
 
 
-# Naya:
-import os
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
