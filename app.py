@@ -19,19 +19,23 @@ app = Flask(__name__)
 CORS(app)
 DB_NAME = "users.db"
 
+# ── Load Extra Trees model ──────────────────────────────────────
 with open("et_model.pkl", 'rb') as f:
     model_data = pickle.load(f)
 et_model = model_data['model']
 scaler   = model_data['scaler']
 
+# ── Load EEG epochs ─────────────────────────────────────────────
 with open("all_epochs_final.pkl", 'rb') as f:
     all_epochs = pickle.load(f)
 
+# ── Load stored VGG features ────────────────────────────────────
 with open("stored_vgg_features.pkl", 'rb') as f:
     stored_data = pickle.load(f)
 stored_vgg    = stored_data['vgg_features']
 stored_labels = stored_data['labels']
 
+# ── Load VGG16 ──────────────────────────────────────────────────
 vgg_model = VGG16(
     weights='imagenet',
     include_top=False,
@@ -40,17 +44,20 @@ vgg_model = VGG16(
 )
 print("VGG16 loaded!")
 
+# ── Face detector ───────────────────────────────────────────────
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 )
 print("Face detector loaded!")
 
+# ── KNN setup ───────────────────────────────────────────────────
 scaler_vgg        = StandardScaler()
 stored_vgg_scaled = scaler_vgg.fit_transform(stored_vgg)
 knn = NearestNeighbors(n_neighbors=10, metric='cosine', algorithm='brute')
 knn.fit(stored_vgg_scaled)
 print("KNN ready!")
 
+# ── Feature names ───────────────────────────────────────────────
 CH_NAMES = ['P7','P4','Cz','Pz','P3','P8','O1','O2','T8','F8',
             'C4','F4','Fz','C3','F3','T7','F7','Oz','PO4','CP6',
             'CP2','CP1','CP5','PO3']
@@ -82,6 +89,7 @@ SIG_FEAT_NAMES = ['var_P3','skew_P3','mean_P3',
 SIG_INDICES    = [ALL_FEAT_NAMES.index(f) for f in SIG_FEAT_NAMES]
 
 
+# ── EEG feature extraction ──────────────────────────────────────
 def extract_all_eeg_features(epoch_data):
     times_local = np.linspace(-200, 800, 500)
     features    = []
@@ -143,6 +151,7 @@ def extract_all_eeg_features(epoch_data):
     return np.array(features)
 
 
+# ── Database helpers ────────────────────────────────────────────
 def get_db():
     return sqlite3.connect(DB_NAME)
 
@@ -166,6 +175,7 @@ def create_table():
 create_table()
 
 
+# ── Routes ──────────────────────────────────────────────────────
 @app.route("/register", methods=["POST"])
 def register():
     data     = request.json
@@ -214,41 +224,38 @@ def predict():
     except Exception as e:
         return jsonify({"error": "Invalid image file"}), 400
 
-    # ===== Face Detection — STRICT mode =====
-    face_found = False
+    # ===== STRICT Face Detection =====
     try:
         cv_img = np.array(pil_img)
         gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
-        
-        # Pehle strict try karo
+
         faces = face_cascade.detectMultiScale(
                     gray,
-                    scaleFactor=1.05,   # was 1.1 — zyada sensitive
+                    scaleFactor=1.05,   # was 1.1 — more sensitive
                     minNeighbors=4,     # was 3
-                    minSize=(60, 60)    # choti faces ignore karo
+                    minSize=(60, 60)    # was (20,20) — ignore tiny false detections
                 )
-        
+
         if len(faces) > 0:
             # Sabse bara face lo
             faces_sorted = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
-            x, y, w, h = faces_sorted[0]
-            # Thoda padding do face ke around
+            x, y, w, h   = faces_sorted[0]
+            # 10% padding around face
             pad = int(w * 0.1)
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(pil_img.width,  x + w + pad)
-            y2 = min(pil_img.height, y + h + pad)
-            pil_img    = pil_img.crop((x1, y1, x2, y2))
-            face_found = True
+            x1  = max(0, x - pad)
+            y1  = max(0, y - pad)
+            x2  = min(pil_img.width,  x + w + pad)
+            y2  = min(pil_img.height, y + h + pad)
+            pil_img = pil_img.crop((x1, y1, x2, y2))
         else:
-            # ===== Face nahi mili — reject karo =====
+            # Face nahi mili — reject
             return jsonify({"error": "No face detected"}), 200
 
     except Exception as e:
         print(f"Face detection error: {e}")
         return jsonify({"error": "No face detected"}), 200
 
-    # ===== VGG16 features =====
+    # ===== VGG16 feature extraction =====
     img     = pil_img.resize((224, 224))
     img_arr = keras_image.img_to_array(img)
     img_arr = np.expand_dims(img_arr, axis=0)
@@ -259,7 +266,7 @@ def predict():
     new_vgg_scaled     = scaler_vgg.transform(new_vgg.reshape(1, -1))
     distances, indices = knn.kneighbors(new_vgg_scaled)
 
-    # ===== EEG + ET classification =====
+    # ===== EEG + Extra Trees classification =====
     predictions = []
     probas      = []
 
@@ -273,24 +280,20 @@ def predict():
         predictions.append(int(pred))
         probas.append(proba.tolist())
 
-    # ===== Weighted voting (distance-based) =====
+    # ===== Distance-weighted voting (FAKE bias fix) =====
     probas_arr = np.array(probas)
-    
-    # Closer neighbors ko zyada weight do
-    weights = 1.0 / (distances[0] + 1e-6)
-    weights = weights / weights.sum()
+    weights    = 1.0 / (distances[0] + 1e-6)   # closer = more weight
+    weights    = weights / weights.sum()
     avg_proba  = np.average(probas_arr, axis=0, weights=weights)
-    
+
     final_pred = int(np.argmax(avg_proba))
     pred_str   = "REAL" if final_pred == 1 else "FAKE"
-    real_conf  = float(avg_proba[1])
-    fake_conf  = float(avg_proba[0])
 
     return jsonify({
         "prediction": pred_str,
         "confidence": round(float(avg_proba[final_pred]), 2),
-        "real_prob":  round(real_conf, 2),
-        "fake_prob":  round(fake_conf, 2)
+        "real_prob":  round(float(avg_proba[1]), 2),
+        "fake_prob":  round(float(avg_proba[0]), 2)
     })
 
 
