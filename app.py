@@ -214,23 +214,39 @@ def predict():
     except Exception as e:
         return jsonify({"error": "Invalid image file"}), 400
 
-    # ===== Face Detection — VR ke liye bypass =====
+    # ===== Face Detection — STRICT mode =====
+    face_found = False
     try:
         cv_img = np.array(pil_img)
         gray   = cv2.cvtColor(cv_img, cv2.COLOR_RGB2GRAY)
-        faces  = face_cascade.detectMultiScale(
+        
+        # Pehle strict try karo
+        faces = face_cascade.detectMultiScale(
                     gray,
-                    scaleFactor=1.1,
-                    minNeighbors=3,
-                    minSize=(20, 20)
-                 )
-        # VR mode mein face na mile toh bhi continue karo
+                    scaleFactor=1.05,   # was 1.1 — zyada sensitive
+                    minNeighbors=4,     # was 3
+                    minSize=(60, 60)    # choti faces ignore karo
+                )
+        
         if len(faces) > 0:
-            x, y, w, h = faces[0]
-            pil_img = pil_img.crop((x, y, x+w, y+h))
+            # Sabse bara face lo
+            faces_sorted = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
+            x, y, w, h = faces_sorted[0]
+            # Thoda padding do face ke around
+            pad = int(w * 0.1)
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(pil_img.width,  x + w + pad)
+            y2 = min(pil_img.height, y + h + pad)
+            pil_img    = pil_img.crop((x1, y1, x2, y2))
+            face_found = True
+        else:
+            # ===== Face nahi mili — reject karo =====
+            return jsonify({"error": "No face detected"}), 200
+
     except Exception as e:
         print(f"Face detection error: {e}")
-        pass
+        return jsonify({"error": "No face detected"}), 200
 
     # ===== VGG16 features =====
     img     = pil_img.resize((224, 224))
@@ -257,15 +273,24 @@ def predict():
         predictions.append(int(pred))
         probas.append(proba.tolist())
 
-    # ===== Majority voting =====
+    # ===== Weighted voting (distance-based) =====
     probas_arr = np.array(probas)
-    avg_proba  = probas_arr.mean(axis=0)
+    
+    # Closer neighbors ko zyada weight do
+    weights = 1.0 / (distances[0] + 1e-6)
+    weights = weights / weights.sum()
+    avg_proba  = np.average(probas_arr, axis=0, weights=weights)
+    
     final_pred = int(np.argmax(avg_proba))
     pred_str   = "REAL" if final_pred == 1 else "FAKE"
+    real_conf  = float(avg_proba[1])
+    fake_conf  = float(avg_proba[0])
 
     return jsonify({
         "prediction": pred_str,
-        "confidence": round(float(avg_proba[final_pred]), 2)
+        "confidence": round(float(avg_proba[final_pred]), 2),
+        "real_prob":  round(real_conf, 2),
+        "fake_prob":  round(fake_conf, 2)
     })
 
 
